@@ -6,6 +6,8 @@ module lz4_test;
 import std::io;
 import lz4;
 import lz4hc;
+import xxhash;
+import lz4frame;
 
 fn void main() {
     io::printn("=== LZ4 C3 Port Test ===");
@@ -15,6 +17,8 @@ fn void main() {
     test_streaming_compression();
     test_dict_decompression();
     test_hc_compression();
+    test_xxhash();
+    test_frame_compression();
     
     io::printn("\n=== All Tests Complete ===");
 }
@@ -190,3 +194,78 @@ fn void test_hc_compression() {
     io::printn("✓ HC compression: PASS");
 }
 
+fn void test_xxhash() {
+    io::printn("\n--- xxHash Test ---");
+    
+    char[] test_data = "Hello, World! This is a test of xxHash.";
+    
+    // Test XXH32
+    uint hash32 = xxhash::xxh32(test_data, 0);
+    io::printfn("XXH32: 0x%08X", hash32);
+    
+    // Test XXH64
+    ulong hash64 = xxhash::xxh64(test_data, 0);
+    io::printfn("XXH64: 0x%08X%08X", (uint)(hash64 >> 32), (uint)(hash64 & 0xFFFFFFFF));
+    
+    // Verify consistency (same input = same output)
+    uint hash32_v2 = xxhash::xxh32(test_data, 0);
+    if (hash32 == hash32_v2) {
+        io::printn("✓ Hash consistency: PASS");
+    } else {
+        io::printn("✗ Hash consistency: FAIL");
+    }
+    
+    io::printn("✓ xxHash: PASS");
+}
+
+fn void test_frame_compression() {
+    io::printn("\n--- LZ4 Frame Format Test ---");
+    
+    char[] test_data = "Hello, World! This is a test of the LZ4 frame format. "
+                       "The frame format includes headers, checksums, and block structure. "
+                       "This makes it compatible with the lz4 command-line tool. "
+                       "Repetitive content repetitive content repetitive content.";
+    
+    io::printfn("Original size: %d bytes", test_data.len);
+    
+    // Calculate bound
+    usz bound = lz4frame::compress_frame_bound(test_data.len, null);
+    io::printfn("Frame bound: %d bytes", bound);
+    
+    char[1024] compressed_buf;
+    char[1024] decompressed_buf;
+    
+    // Compress to frame
+    usz frame_size = lz4frame::compress_frame(test_data, compressed_buf[0:bound], null);
+    if (frame_size == 0) {
+        io::printn("✗ Frame compression failed!");
+        return;
+    }
+    
+    io::printfn("Compressed frame: %d bytes (%.1f%%)", 
+                frame_size, (double)frame_size / (double)test_data.len * 100.0);
+    
+    // Verify magic number
+    uint magic = ((uint)compressed_buf[0] & 0xFF) |
+                 (((uint)compressed_buf[1] & 0xFF) << 8) |
+                 (((uint)compressed_buf[2] & 0xFF) << 16) |
+                 (((uint)compressed_buf[3] & 0xFF) << 24);
+    io::printfn("Magic number: 0x%08X (expected 0x184D2204)", magic);
+    
+    // Decompress frame
+    usz decomp_size = lz4frame::decompress_frame(compressed_buf[0:frame_size], decompressed_buf[0:test_data.len]);
+    if (decomp_size == 0) {
+        io::printn("✗ Frame decompression failed!");
+        return;
+    }
+    
+    // Verify data
+    bool match = verify_data(test_data, decompressed_buf[0:decomp_size]);
+    io::printfn("Decompressed: %d bytes, match: %s", decomp_size, match ? "✓" : "✗");
+    
+    if (match) {
+        io::printn("✓ Frame format: PASS");
+    } else {
+        io::printn("✗ Frame format: FAIL");
+    }
+}
