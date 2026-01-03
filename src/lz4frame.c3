@@ -129,93 +129,60 @@ fn usz compress_frame(char[] src, char[] dst, Preferences* prefs) {
     if (src.len == 0) return 0;
     if (dst.len < compress_frame_bound(src.len, prefs)) return 0;
     
-    Preferences local_prefs;
-    if (prefs != null) {
-        local_prefs = *prefs;
-    } else {
-        local_prefs.frame_info.block_size_id = BLOCK_MAX64KB;
-        local_prefs.frame_info.block_mode = MODE_INDEPENDENT;
-        local_prefs.frame_info.content_checksum = CHECKSUM_ENABLED;
-        local_prefs.frame_info.block_checksum = CHECKSUM_DISABLED;
-        local_prefs.frame_info.content_size = 0;
-        local_prefs.frame_info.dict_id = 0;
-        local_prefs.compression_level = 0;
-        local_prefs.auto_flush = true;
+    // Use streaming API for simplicity and code reuse
+    CompressionContext* ctx = create_compression_context();
+    if (ctx == null) return 0;
+    
+    usz total_written = 0;
+    
+    // 1. Begin
+    usz w1 = compress_begin(ctx, dst, prefs);
+    if (w1 == 0) {
+        free_compression_context(ctx);
+        return 0;
+    }
+    total_written += w1;
+    
+    // 2. Update
+    if (src.len > 0) {
+        usz w2 = compress_update(ctx, dst[total_written:dst.len-total_written], src);
+        // Note: w2 can be 0 if data is buffered
+        total_written += w2;
     }
     
-    char* op = dst.ptr;
-    char* op_end = dst.ptr + dst.len;
+    // 3. End
+    usz w3 = compress_end(ctx, dst[total_written:dst.len-total_written]);
+    if (w3 == 0) {
+        free_compression_context(ctx);
+        return 0;
+    }
+    total_written += w3;
     
-    // Write header
-    usz header_size = write_frame_header(op, op_end, &local_prefs, src.len);
-    if (header_size == 0) return 0;
-    op += header_size;
+    free_compression_context(ctx);
+    return total_written;
+}
+
+/**
+ * Extract frame parameters from a frame header.
+ * 
+ * @param src : source buffer pointing to the start of the frame
+ * @param info : pointer to FrameInfo structure to fill
+ * @param src_size_consumed : out parameter, set to number of bytes consumed (header size)
+ * @return : 0 on success, or non-zero error code/0 on failure if header is incomplete
+ */
+fn usz get_frame_info(char[] src, FrameInfo* info, usz* src_size_consumed) {
+    if (src.len < HEADER_SIZE_MIN) return 1; // Error
     
-    // Initialize content checksum
-    xxhash::State32 content_xxh;
-    xxhash::reset32(&content_xxh, 0);
-    if (local_prefs.frame_info.content_checksum == CHECKSUM_ENABLED) {
-        xxhash::update32(&content_xxh, src);
+    // We reuse parse_frame_header which returns bytes read
+    usz header_size = parse_frame_header(src.ptr, src.ptr + src.len, info);
+    
+    if (header_size == 0) return 1; // Error
+    
+    if (src_size_consumed != null) {
+        *src_size_consumed = header_size;
     }
     
-    // Compress blocks
-    usz block_size = get_block_size(local_prefs.frame_info.block_size_id);
-    char* ip = src.ptr;
-    char* ip_end = src.ptr + src.len;
-    
-    while (ip < ip_end) {
-        usz remaining = (usz)(ip_end - ip);
-        usz this_block = remaining < block_size ? remaining : block_size;
-        
-        // Compress block
-        char[] block_src = ip[0:this_block];
-        usz max_dst = lz4::compress_bound((int)this_block);
-        
-        if (op + BLOCK_HEADER_SIZE + max_dst > op_end) return 0;
-        
-        int compressed_size;
-        if (local_prefs.compression_level >= 3) {
-            compressed_size = lz4hc::compress_hc(block_src, op[BLOCK_HEADER_SIZE:max_dst], local_prefs.compression_level);
-        } else {
-            compressed_size = lz4::compress_default(block_src, op[BLOCK_HEADER_SIZE:max_dst]);
-        }
-        
-        // Check if compression was effective
-        if (compressed_size > 0 && (usz)compressed_size < this_block) {
-            // Write compressed block
-            write_le32(op, (uint)compressed_size);
-            op += (usz)BLOCK_HEADER_SIZE + (usz)compressed_size;
-        } else {
-            // Store uncompressed
-            write_le32(op, (uint)this_block | BLOCK_UNCOMPRESSED_FLAG);
-            op += BLOCK_HEADER_SIZE;
-            for (usz i = 0; i < this_block; i++) {
-                *op++ = ip[i];
-            }
-        }
-        
-        // Block checksum (optional)
-        if (local_prefs.frame_info.block_checksum == CHECKSUM_ENABLED) {
-            uint block_crc = xxhash::xxh32(op[-compressed_size:compressed_size], 0);
-            write_le32(op, block_crc);
-            op += BLOCK_CHECKSUM_SIZE;
-        }
-        
-        ip += this_block;
-    }
-    
-    // Write end mark (0x00000000)
-    write_le32(op, 0);
-    op += BLOCK_HEADER_SIZE;
-    
-    // Write content checksum
-    if (local_prefs.frame_info.content_checksum == CHECKSUM_ENABLED) {
-        uint content_crc = xxhash::digest32(&content_xxh);
-        write_le32(op, content_crc);
-        op += BLOCK_CHECKSUM_SIZE;
-    }
-    
-    return (usz)(op - dst.ptr);
+    return 0; // Success
 }
 
 /**

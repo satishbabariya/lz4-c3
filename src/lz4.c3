@@ -120,7 +120,22 @@ fn int decompress_safe(char[] src, char[] dst) {
     if (src.len == 0 || dst.len == 0) {
         return -1;
     }
-    return decompress_generic(src, dst);
+    return decompress_generic(src, dst, dst.len);
+}
+
+/**
+ * Decompresses 'src' into 'dst', stopping when 'target_output_size' is reached.
+ * useful for parsing headers or partial data.
+ *
+ * @param src : compressed source buffer
+ * @param dst : destination buffer
+ * @param target_output_size : stop decoding after this many bytes
+ * @return : number of bytes decoded, or negative on error
+ */
+fn int decompress_safe_partial(char[] src, char[] dst, int target_output_size) {
+    if (src.len == 0 || dst.len == 0) return -1;
+    if (target_output_size > dst.len) target_output_size = dst.len;
+    return decompress_generic(src, dst, target_output_size);
 }
 
 // ============================================================================
@@ -425,12 +440,13 @@ fn int output_last_literals(char* anchor, char* iend, char* op, char* olimit, ch
     return (int)(op - dst_start);  // Calculate written bytes from start
 }
 
-fn int decompress_generic(char[] src, char[] dst) @private {
+fn int decompress_generic(char[] src, char[] dst, int target_size) @private {
     char* ip = src.ptr;
     char* iend = src.ptr + src.len;
     
     char* op = dst.ptr;
     char* oend = dst.ptr + dst.len;
+    char* oexit = dst.ptr + target_size;
     
     while (ip < iend) {
         // Get the token
@@ -460,7 +476,7 @@ fn int decompress_generic(char[] src, char[] dst) @private {
         }
         
         // Check if this was the last sequence
-        if (ip >= iend) {
+        if (ip >= iend || op >= oexit) {
             break;
         }
         

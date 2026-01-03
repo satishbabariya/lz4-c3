@@ -20,6 +20,7 @@ fn void main() {
     test_xxhash();
     test_frame_compression();
     test_streaming_frame();
+    test_new_features();
     
     io::printn("\n=== All Tests Complete ===");
 }
@@ -343,3 +344,44 @@ fn void test_streaming_frame() {
     }
 }
 
+
+fn void test_new_features() {
+    io::printn("\n--- New Features Test ---");
+    
+    // 1. Partial Decompression
+    char[200] src_buf;
+    char[200] partial_dst;
+    char[] test_str = "Partial Decompression Test String";
+    int c_len = lz4::compress_default(test_str, src_buf[..]);
+    
+    // Decompress at least first 7 chars
+    int p_len = lz4::decompress_safe_partial(src_buf[0:c_len], partial_dst[..], 7);
+    io::printf("Partial decompress (target 7): %d bytes -> '%.*s'\n", p_len, (p_len > 0 ? p_len : 0), (char*)&partial_dst);
+    
+    // Note: decompress_safe_partial output is block/sequence granular, so it might return more than 7
+    if (p_len >= 7) {
+        io::printn("✓ decompress_safe_partial: PASS");
+    } else {
+        io::printn("✗ decompress_safe_partial: FAIL");
+    }
+
+    // 2. Get Frame Info
+    char[200] frame_buf;
+    lz4frame::Preferences prefs;
+    prefs.frame_info.block_size_id = lz4frame::BLOCK_MAX64KB; // ID 4
+    
+    usz frame_len = lz4frame::compress_frame(test_str, frame_buf[..], &prefs);
+    
+    lz4frame::FrameInfo info;
+    usz consumed = 0;
+    usz err = lz4frame::get_frame_info(frame_buf[0:frame_len], &info, &consumed);
+    io::printf("Frame Info: Error=%d, Consumed=%d bytes, BlockID=%d\n", err, consumed, info.block_size_id);
+    
+    // Note: compress_frame uses default preferences if not fully set or slightly modifies them.
+    // Specifically parse_frame_header should read what was written.
+    if (err == 0 && consumed >= 7 && info.block_size_id == lz4frame::BLOCK_MAX64KB) {
+        io::printn("✓ get_frame_info: PASS");
+    } else {
+        io::printn("✗ get_frame_info: FAIL");
+    }
+}
