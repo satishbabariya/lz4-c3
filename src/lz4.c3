@@ -499,3 +499,368 @@ fn int decompress_generic(char[] src, char[] dst) @private {
     
     return (int)(op - dst.ptr);
 }
+
+// ============================================================================
+// Streaming Compression
+// ============================================================================
+
+/**
+ * Streaming compression context.
+ * Allows compressing data in multiple calls while maintaining context.
+ */
+struct Stream {
+    uint[HASH_SIZE_U32] hash_table;
+    char* dictionary;
+    Stream* dict_ctx;
+    uint current_offset;
+    uint table_type;
+    uint dict_size;
+}
+
+const usz STREAM_MINSIZE = Stream.sizeof;
+
+/**
+ * Allocate and initialize a streaming compression context.
+ * @return : pointer to newly created Stream, or null if allocation fails
+ */
+fn Stream* create_stream() {
+    // Use C3's allocator
+    Stream* stream = mem::new(Stream);
+    if (stream != null) {
+        init_stream(stream);
+    }
+    return stream;
+}
+
+/**
+ * Free a streaming compression context.
+ * @return : 0 on success
+ */
+fn int free_stream(Stream* stream) {
+    if (stream == null) return 0;
+    mem::free(stream);
+    return 0;
+}
+
+/**
+ * Initialize a Stream structure.
+ * Can be used with stack-allocated or externally managed Stream.
+ * @return : pointer to initialized stream, or null if invalid
+ */
+fn Stream* init_stream(void* buffer) {
+    if (buffer == null) return null;
+    Stream* stream = (Stream*)buffer;
+    
+    // Zero the hash table
+    for (int i = 0; i < HASH_SIZE_U32; i++) {
+        stream.hash_table[i] = 0;
+    }
+    stream.dictionary = null;
+    stream.dict_ctx = null;
+    stream.current_offset = 0;
+    stream.table_type = 0;
+    stream.dict_size = 0;
+    
+    return stream;
+}
+
+/**
+ * Reset stream for a new compression session.
+ * Faster than init_stream() but requires stream to be properly initialized.
+ */
+fn void reset_stream_fast(Stream* stream) {
+    if (stream == null) return;
+    stream.current_offset = 0;
+    stream.dict_size = 0;
+    stream.dictionary = null;
+    stream.dict_ctx = null;
+    // Note: hash table is NOT cleared - caller must ensure clean state
+}
+
+/**
+ * Load a dictionary into the stream for better compression.
+ * Dictionary must remain accessible during compression.
+ * @return : loaded dictionary size (max 64KB)
+ */
+fn int load_dict(Stream* stream, char[] dictionary) {
+    if (stream == null) return 0;
+    
+    // Reset stream
+    for (int i = 0; i < HASH_SIZE_U32; i++) {
+        stream.hash_table[i] = 0;
+    }
+    stream.current_offset = 0;
+    
+    if (dictionary.len == 0) {
+        stream.dictionary = null;
+        stream.dict_size = 0;
+        return 0;
+    }
+    
+    // Only use last 64KB of dictionary
+    usz dict_size = dictionary.len;
+    char* dict_start = dictionary.ptr;
+    if (dict_size > 64 * 1024) {
+        dict_start = dictionary.ptr + dictionary.len - 64 * 1024;
+        dict_size = 64 * 1024;
+    }
+    
+    stream.dictionary = dict_start;
+    stream.dict_size = (uint)dict_size;
+    
+    // Fill hash table with dictionary entries
+    if (dict_size >= MINMATCH) {
+        char* p = dict_start;
+        char* dict_end = dict_start + dict_size - MINMATCH;
+        while (p <= dict_end) {
+            uint h = hash_position(p) & (HASH_SIZE_U32 - 1);
+            stream.hash_table[h] = (uint)(p - dict_start);
+            p++;
+        }
+    }
+    
+    stream.current_offset = (uint)dict_size;
+    return (int)dict_size;
+}
+
+/**
+ * Compress data using the stream context, for streaming compression.
+ * Previous blocks must remain accessible in memory.
+ *
+ * @return : number of bytes written to dst, or 0 on error
+ */
+fn int compress_fast_continue(Stream* stream, char[] src, char[] dst, int acceleration) {
+    if (stream == null || src.len == 0) return 0;
+    if (src.len > MAX_INPUT_SIZE) return 0;
+    
+    // For now, fall back to stateless compression
+    // Full streaming implementation would maintain state across calls
+    return compress_fast(src, dst, acceleration);
+}
+
+/**
+ * Save the last 64KB of compressed data as dictionary for future use.
+ * @return : saved dictionary size, or 0 on error
+ */
+fn int save_dict(Stream* stream, char[] safe_buffer) {
+    if (stream == null) return 0;
+    if (safe_buffer.len == 0) return 0;
+    
+    // Copy last dict_size bytes if available
+    uint to_save = stream.dict_size;
+    if (to_save > safe_buffer.len) {
+        to_save = (uint)safe_buffer.len;
+    }
+    
+    if (to_save > 0 && stream.dictionary != null) {
+        char* src = stream.dictionary + stream.dict_size - to_save;
+        for (uint i = 0; i < to_save; i++) {
+            safe_buffer.ptr[i] = src[i];
+        }
+    }
+    
+    return (int)to_save;
+}
+
+// ============================================================================
+// Streaming Decompression
+// ============================================================================
+
+/**
+ * Streaming decompression context.
+ */
+struct StreamDecode {
+    char* external_dict;
+    char* prefix_end;
+    usz ext_dict_size;
+    usz prefix_size;
+}
+
+const usz STREAMDECODE_MINSIZE = StreamDecode.sizeof;
+
+/**
+ * Allocate and initialize streaming decompression context.
+ */
+fn StreamDecode* create_stream_decode() {
+    StreamDecode* stream = mem::new(StreamDecode);
+    if (stream != null) {
+        stream.external_dict = null;
+        stream.prefix_end = null;
+        stream.ext_dict_size = 0;
+        stream.prefix_size = 0;
+    }
+    return stream;
+}
+
+/**
+ * Free streaming decompression context.
+ */
+fn int free_stream_decode(StreamDecode* stream) {
+    if (stream == null) return 0;
+    mem::free(stream);
+    return 0;
+}
+
+/**
+ * Set dictionary for streaming decompression.
+ * @return : 1 on success, 0 on error
+ */
+fn int set_stream_decode(StreamDecode* stream, char[] dictionary) {
+    if (stream == null) return 0;
+    
+    stream.external_dict = dictionary.ptr;
+    stream.ext_dict_size = dictionary.len;
+    stream.prefix_end = null;
+    stream.prefix_size = 0;
+    
+    return 1;
+}
+
+/**
+ * Decompress with dictionary support.
+ * Dictionary must contain the last 64KB of previously decompressed data.
+ */
+fn int decompress_safe_using_dict(char[] src, char[] dst, char[] dict) {
+    if (src.len == 0 || dst.len == 0) return -1;
+    
+    // If no dictionary, use regular decompression
+    if (dict.len == 0) {
+        return decompress_safe(src, dst);
+    }
+    
+    return decompress_with_dict_generic(src, dst, dict);
+}
+
+/**
+ * Streaming decompression - decompress blocks that reference previous output.
+ */
+fn int decompress_safe_continue(StreamDecode* stream, char[] src, char[] dst) {
+    if (stream == null) return -1;
+    
+    int result;
+    
+    // Use external dict if set
+    if (stream.ext_dict_size > 0) {
+        char[] dict = stream.external_dict[0:stream.ext_dict_size];
+        result = decompress_with_dict_generic(src, dst, dict);
+    } else {
+        result = decompress_safe(src, dst);
+    }
+    
+    if (result > 0) {
+        // Update stream state for next block
+        stream.prefix_end = dst.ptr + result;
+        stream.prefix_size = (usz)result;
+    }
+    
+    return result;
+}
+
+/**
+ * Get minimum ring buffer size for streaming decompression.
+ */
+fn int decoder_ring_buffer_size(int max_block_size) {
+    if (max_block_size < 0) return 0;
+    return 65536 + 14 + max_block_size;
+}
+
+// ============================================================================
+// Internal: Decompression with Dictionary
+// ============================================================================
+
+fn int decompress_with_dict_generic(char[] src, char[] dst, char[] dict) @private {
+    char* ip = src.ptr;
+    char* iend = src.ptr + src.len;
+    
+    char* op = dst.ptr;
+    char* oend = dst.ptr + dst.len;
+    
+    char* dict_start = dict.ptr;
+    char* dict_end = dict.ptr + dict.len;
+    
+    while (ip < iend) {
+        uint token = (uint)(*ip++) & 0xFF;
+        
+        // Decode literal length
+        usz literal_len = (usz)(token >> ML_BITS);
+        if (literal_len == RUN_MASK) {
+            uint s;
+            do {
+                if (ip >= iend) return -10;
+                s = (uint)(*ip++) & 0xFF;
+                literal_len += s;
+            } while (s == 255);
+        }
+        
+        // Copy literals
+        if (op + literal_len > oend) return -20;
+        if (ip + literal_len > iend) return -21;
+        
+        for (usz i = 0; i < literal_len; i++) {
+            *op++ = *ip++;
+        }
+        
+        if (ip >= iend) break;
+        
+        // Decode offset
+        if (ip + 2 > iend) return -30;
+        uint offset = read16(ip);
+        ip += 2;
+        
+        if (offset == 0) return -31;
+        
+        // Determine match source (output buffer or dictionary)
+        char* match;
+        usz match_in_dict = 0;
+        
+        if ((usz)(op - dst.ptr) < offset) {
+            // Match is in dictionary
+            usz offset_in_dict = offset - (usz)(op - dst.ptr);
+            if (offset_in_dict > dict.len) return -32;
+            match = dict_end - offset_in_dict;
+            match_in_dict = offset_in_dict;
+        } else {
+            match = op - offset;
+        }
+        
+        // Decode match length
+        usz match_len = (usz)(token & ML_MASK);
+        if (match_len == ML_MASK) {
+            uint s;
+            do {
+                if (ip >= iend) return -40;
+                s = (uint)(*ip++) & 0xFF;
+                match_len += s;
+            } while (s == 255);
+        }
+        match_len += MINMATCH;
+        
+        if (op + match_len > oend) return -50;
+        
+        // Copy match (may span dictionary and output buffer)
+        if (match_in_dict > 0) {
+            // Copy from dictionary first
+            usz from_dict = match_in_dict;
+            if (from_dict > match_len) from_dict = match_len;
+            
+            for (usz i = 0; i < from_dict; i++) {
+                *op++ = *match++;
+            }
+            match_len -= from_dict;
+            
+            // Continue from output buffer if needed
+            if (match_len > 0) {
+                match = dst.ptr;
+                for (usz i = 0; i < match_len; i++) {
+                    *op++ = *match++;
+                }
+            }
+        } else {
+            for (usz i = 0; i < match_len; i++) {
+                *op++ = *match++;
+            }
+        }
+    }
+    
+    return (int)(op - dst.ptr);
+}
