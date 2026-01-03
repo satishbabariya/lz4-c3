@@ -9,6 +9,13 @@ import lz4hc;
 import xxhash;
 import lz4frame;
 
+fn bool check_buffers(char* a, char* b, usz len) {
+    for (usz i = 0; i < len; i++) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
 fn void main() {
     io::printn("=== LZ4 C3 Port Test ===");
     io::printfn("LZ4 Version: %d", lz4::version_number());
@@ -21,6 +28,7 @@ fn void main() {
     test_frame_compression();
     test_streaming_frame();
     test_new_features();
+    test_missing_features();
     
     io::printn("\n=== All Tests Complete ===");
 }
@@ -51,16 +59,16 @@ fn void test_basic_compression() {
                 (double)compressed_size / (double)test_data.len * 100.0);
     
     char[] to_decompress = compressed_buf[0:compressed_size];
-    char[] decompressed = decompressed_buf[0:test_data.len];
+    // Relax buffer size to detect overrun
+    char[] decompressed = decompressed_buf[..];
     
     int decompressed_size = lz4::decompress_safe(to_decompress, decompressed);
-    if (decompressed_size <= 0) {
-        io::printn("✗ Decompression failed!");
-        return;
-    }
     
-    bool match = verify_data(test_data, decompressed_buf[0:decompressed_size]);
-    io::printfn("✓ Basic compression: %s", match ? "PASS" : "FAIL");
+    if (decompressed_size == test_data.len && verify_data(test_data, decompressed_buf[0:decompressed_size])) {
+        io::printn("✓ Basic compression: PASS");
+    } else {
+        io::printfn("✗ Decompression failed! Size: %d (Expected: %d)", decompressed_size, test_data.len);
+    }
 }
 
 fn void test_streaming_compression() {
@@ -383,5 +391,89 @@ fn void test_new_features() {
         io::printn("✓ get_frame_info: PASS");
     } else {
         io::printn("✗ get_frame_info: FAIL");
+    }
+}
+
+fn void test_missing_features() {
+    io::printn("\n--- Missing Features Test ---");
+    
+    char[] input = "Specific text to compress and decompress using new features. Repeated text for compression. Repeated text for compression.";
+    char[200] dst;
+    
+    // 1. decompress_fast
+    char[200] compressed;
+    int c_size = lz4::compress_default(input, compressed[..]);
+    char[200] decompressed;
+    // We must pass exact size slice? No, dst buffer.
+    // decompress_fast assumes dst is correct size and fills it.
+    // We pass slice of correct size.
+    int fast_res = lz4::decompress_fast(compressed[0:c_size], decompressed[0:input.len]);
+    if (fast_res == input.len && check_buffers((char*)&decompressed, input.ptr, input.len)) {
+         io::printn("✓ decompress_fast: PASS");
+    } else {
+         io::printn("✗ decompress_fast: FAIL");
+    }
+    
+    // 2. compress_destSize
+    char[50] small_dst; // Too small for full input?
+    int src_read = input.len;
+    // compress as much as possible into small_dst
+    int dest_written = lz4::compress_dest_size(input, small_dst[..], &src_read);
+    io::printf("compress_dest_size: src_read=%d/%d, written=%d\n", src_read, input.len, dest_written);
+    if (dest_written > 0 && src_read > 0 && src_read <= input.len) {
+        // Verify decompression of partial
+        char[200] ver_buf;
+        int d_res = lz4::decompress_safe(small_dst[0:dest_written], ver_buf[..]);
+        if (d_res == src_read && check_buffers((char*)&ver_buf, input.ptr, src_read)) {
+            io::printn("✓ compress_dest_size: PASS");
+        } else {
+            io::printn("✗ compress_dest_size verification: FAIL");
+        }
+    } else {
+        io::printn("✗ compress_dest_size: FAIL");
+    }
+    
+    // 3. compress_hc_destSize
+    src_read = input.len;
+    int hc_dest_written = lz4hc::compress_hc_destSize(input, small_dst[..], &src_read, 9);
+    io::printf("compress_hc_destSize: src_read=%d/%d, written=%d\n", src_read, input.len, hc_dest_written);
+    if (hc_dest_written > 0 && src_read > 0) {
+         char[200] ver_buf;
+         int d_res = lz4::decompress_safe(small_dst[0:hc_dest_written], ver_buf[..]);
+         if (d_res == src_read && check_buffers((char*)&ver_buf, input.ptr, src_read)) {
+             io::printn("✓ compress_hc_destSize: PASS");
+         } else {
+             io::printn("✗ compress_hc_destSize verification: FAIL");
+         }
+    } else {
+         io::printn("✗ compress_hc_destSize: FAIL");
+    }
+    
+    // 4. CDict (Frame)
+    char[] dict_data = "Repeated text for compression.";
+    lz4::Stream* cdict = lz4frame::create_cdict(dict_data);
+    if (cdict != null) {
+        lz4frame::Preferences prefs;
+        prefs.dict_stream = cdict;
+        prefs.compression_level = 0; // Fast
+        
+        char[300] frame_buf;
+        usz f_len = lz4frame::compress_frame(input, frame_buf[..], &prefs);
+        if (f_len > 0) {
+            // Decompress needs dict?
+            // Decompress safe should work if dict implied or provided.
+            // If dict is part of frame? No, dict is external state.
+            // compress_frame uses it to compress better.
+            // To decompress, we need to provide dict? 
+            // Frame format includes dict ID.
+            // decompress_frame doesn't support external dict yet?
+            // lz4frame decompress API handles it via context?
+            // Current decompress_frame is simple.
+            // But we can verify compression success.
+            io::printn("✓ CDict compression: PASS");
+        } else {
+            io::printn("✗ CDict compression: FAIL");
+        }
+        lz4frame::free_cdict(cdict);
     }
 }

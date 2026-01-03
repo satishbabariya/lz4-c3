@@ -138,6 +138,36 @@ fn int decompress_safe_partial(char[] src, char[] dst, int target_output_size) {
     return decompress_generic(src, dst, target_output_size);
 }
 
+
+/**
+ * Decompresses data into 'dst' of known size.
+ * This function believes that 'dst' is fully valid and expects to fill it.
+ * Note: checks input validity to avoid OOB reads (safer than C version).
+ *
+ * @param src : compressed source buffer
+ * @param dst : destination buffer (must be exact size of original data)
+ * @return : number of bytes decompressed (should be equal to dst.len), or negative on error
+ */
+fn int decompress_fast(char[] src, char[] dst) {
+    if (src.len == 0 || dst.len == 0) return -1;
+    return decompress_generic(src, dst, dst.len);
+}
+
+/**
+ * Reverse compression: compresses as much source as possible into fixed-size destination.
+ *
+ * @param src : source buffer
+ * @param dst : destination buffer (fixed size)
+ * @param src_read : output parameter, will contain available source size
+ * @return : bytes written to dst, or 0 on error
+ */
+fn int compress_dest_size(char[] src, char[] dst, int* src_size_ptr) {
+    if (src.len == 0 || dst.len == 0) return 0;
+    
+    // Check bounds using normal generic if dst is huge? 
+    // No, we need specific logic.
+    return compress_generic_dest_size(src, dst, src_size_ptr);
+}
 // ============================================================================
 // Internal Implementation
 // ============================================================================
@@ -397,7 +427,6 @@ fn int compress_generic(char[] src, char[] dst, int acceleration) @private {
             }
             
             anchor = ip;
-            
             if (ip > mflimit_p) break;
             
             put_position(ip - 2, base, &hash_table);
@@ -412,6 +441,199 @@ fn int compress_generic(char[] src, char[] dst, int acceleration) @private {
     // Output last literals
     return output_last_literals(anchor, iend, op, olimit, dst.ptr);
 }
+
+fn int compress_generic_dest_size(char[] src, char[] dst, int* src_size_ptr) @private {
+    char* ip = src.ptr;
+    char* base = src.ptr;
+    char* anchor = ip;
+    char* iend = src.ptr + src.len;
+    char* mflimit_p = iend - MFLIMIT;
+    char* match_limit = iend - LASTLITERALS;
+    
+    char* op = dst.ptr;
+    char* olimit = dst.ptr + dst.len;
+    char* op_bottom = olimit - 1 - LASTLITERALS - RUN_MASK;   
+    char* op_threshold = olimit - (1 + LASTLITERALS);
+
+    // Hash table on stack
+    uint[HASH_SIZE_U32] hash_table;
+    for (int i = 0; i < HASH_SIZE_U32; i++) {
+        hash_table[i] = 0;
+    }
+
+    if (src.len < MFLIMIT + 1) {
+        // Just literals
+        return output_last_literals_dest_size(anchor, iend, op, olimit, dst.ptr, src_size_ptr, base);
+    }
+
+    put_position(ip, base, &hash_table);
+    ip++;
+    uint forwardH = hash_position(ip);
+
+    while (true) {
+        char* match;
+        char* token;
+        
+        // Find match
+        {
+            char* forward_ip = ip;
+            uint step = 1;
+            uint search_match_nb = 1 << SKIP_TRIGGER;
+            
+            while (true) {
+                uint h = forwardH;
+                ip = forward_ip;
+                forward_ip += step;
+                step = search_match_nb >> SKIP_TRIGGER;
+                search_match_nb++;
+                
+                if (forward_ip > mflimit_p) {
+                   return output_last_literals_dest_size(anchor, iend, op, olimit, dst.ptr, src_size_ptr, base);
+                }
+                
+                match = base + hash_table[h];
+                forwardH = hash_position(forward_ip);
+                hash_table[h] = (uint)(ip - base);
+                
+                if (read32(match) == read32(ip) && match != ip) {
+                    if (ip - match <= DISTANCE_MAX) break;
+                }
+            }
+        }
+        
+        while (ip > anchor && match > base && ip[-1] == match[-1]) {
+            ip--; match--;
+        }
+        
+        // Encode Literals
+        {
+            uint lit_length = (uint)(ip - anchor);
+            token = op++;
+            
+            // Check output limit
+            if (op + lit_length + (lit_length >> 8) > op_threshold) {
+                // Cannot compress anymore, fill with literals
+                return output_last_literals_dest_size(anchor, iend, op - 1, olimit, dst.ptr, src_size_ptr, base);
+            }
+            
+            if (lit_length >= RUN_MASK) {
+                *token = (char)(RUN_MASK << ML_BITS);
+                uint len = lit_length - RUN_MASK;
+                while (len >= 255) {
+                    *op++ = (char)255;
+                    len -= 255;
+                }
+                *op++ = (char)len;
+            } else {
+                *token = (char)(lit_length << ML_BITS);
+            }
+            
+            char* lit_end = anchor + lit_length;
+            while (anchor < lit_end) *op++ = *anchor++;
+        }
+        
+        // Encode Offset
+        {
+             write16(op, (ushort)(ip - match));
+             op += 2;
+        }
+        
+        // Encode MatchLength
+        {
+            ip += MINMATCH; match += MINMATCH;
+            anchor = ip;
+            
+            uint match_length = count_match(ip, match, match_limit);
+            ip += match_length;
+            
+            if (match_length >= ML_MASK) {
+                 *token += (char)ML_MASK;
+                 match_length -= ML_MASK;
+                 while (match_length >= 255) {
+                     *op++ = (char)255;
+                     match_length -= 255;
+                 }
+                 *op++ = (char)match_length;
+            } else {
+                *token += (char)match_length;
+            }
+        }
+        
+        anchor = ip;
+        
+        if (ip > mflimit_p) break;
+        if (op > op_bottom) {
+             // Close to end of output check
+             return output_last_literals_dest_size(anchor, iend, op, olimit, dst.ptr, src_size_ptr, base);
+        }
+        
+        put_position(ip - 2, base, &hash_table);
+        
+        // Next match
+        uint h = hash_position(ip);
+        match = base + hash_table[h];
+        if (read32(match) == read32(ip) && ip - match <= DISTANCE_MAX && match != ip) {
+            hash_table[h] = (uint)(ip - base);
+            token = op++;
+            *token = 0;
+            write16(op, (ushort)(ip - match));
+            op += 2;
+            
+            ip += MINMATCH; match += MINMATCH;
+            anchor = ip;
+            uint match_length = count_match(ip, match, match_limit);
+            ip += match_length;
+             
+             if (match_length >= ML_MASK) {
+                 *token = (char)ML_MASK;
+                 match_length -= ML_MASK;
+                 while (match_length >= 255) {
+                     *op++ = (char)255;
+                     match_length -= 255;
+                 }
+                 *op++ = (char)match_length;
+             } else {
+                 *token = (char)match_length;
+             }
+             
+             anchor = ip;
+             if (ip > mflimit_p) break;
+             if (op > op_bottom) return output_last_literals_dest_size(anchor, iend, op, olimit, dst.ptr, src_size_ptr, base);
+             
+             put_position(ip - 2, base, &hash_table);
+        } else {
+            hash_table[h] = (uint)(ip - base);
+        }
+        
+        forwardH = hash_position(ip);
+    }
+    
+    return output_last_literals_dest_size(anchor, iend, op, olimit, dst.ptr, src_size_ptr, base);
+}
+
+fn int output_last_literals_dest_size(char* anchor, char* iend, char* op, char* olimit, char* dst_start, int* src_size_ptr, char* base) @private {
+    usz available_space = (usz)(olimit - op);
+    if (available_space < 1) return 0; // Full
+    
+    usz max_lit = available_space - 1;
+    usz lit_len = (usz)(iend - anchor);
+    
+    if (lit_len > max_lit) {
+        lit_len = max_lit;
+        while (lit_len > 0) {
+             usz overhead = 1 + (lit_len >= 15 ? (lit_len - 15)/255 + 1 : 0);
+             if (overhead + lit_len <= available_space) break;
+             lit_len--;
+        }
+    }
+    
+    if (src_size_ptr != null) {
+        *src_size_ptr = (int)((anchor + lit_len) - base);
+    }
+    
+    return output_last_literals(anchor, anchor + lit_len, op, olimit, dst_start);
+}
+
 
 fn int output_last_literals(char* anchor, char* iend, char* op, char* olimit, char* dst_start) @private {
     usz last_run = (usz)(iend - anchor);

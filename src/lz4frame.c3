@@ -66,6 +66,8 @@ struct Preferences {
     FrameInfo frame_info;
     int compression_level;  // 0=fast, 1-12=HC levels
     bool auto_flush;
+    lz4::Stream* dict_stream;    // pre-digested dictionary (fast mode)
+    lz4hc::StreamHC* dict_stream_hc; // pre-digested dictionary (HC mode)
 }
 
 /**
@@ -367,9 +369,15 @@ fn usz compress_begin(CompressionContext* ctx, char[] dst, Preferences* prefs) {
         if (ctx.lz4hc_ctx == null) {
             ctx.lz4hc_ctx = lz4hc::create_stream_hc();
         }
+        if (ctx.prefs.dict_stream_hc != null) {
+            lz4hc::attach_HC_dictionary(ctx.lz4hc_ctx, ctx.prefs.dict_stream_hc);
+        }
     } else {
         if (ctx.lz4_ctx == null) {
             ctx.lz4_ctx = lz4::create_stream();
+        }
+        if (ctx.prefs.dict_stream != null) {
+            lz4::attach_dictionary(ctx.lz4_ctx, ctx.prefs.dict_stream);
         }
     }
     
@@ -635,4 +643,37 @@ fn ulong read_le64(char* src) @private {
            (((ulong)src[5] & 0xFF) << 40) |
            (((ulong)src[6] & 0xFF) << 48) |
            (((ulong)src[7] & 0xFF) << 56);
+}
+
+// ============================================================================
+// Dictionary Helpers (CDict)
+// ============================================================================
+
+/**
+ * Create a digested dictionary for fast compression.
+ */
+fn lz4::Stream* create_cdict(char[] dict_buffer) {
+    lz4::Stream* cdict = lz4::create_stream();
+    if (cdict == null) return null;
+    lz4::load_dict(cdict, dict_buffer);
+    return cdict;
+}
+
+/**
+ * Create a digested dictionary for HC compression.
+ */
+fn lz4hc::StreamHC* create_cdict_hc(char[] dict_buffer, int compression_level) {
+    lz4hc::StreamHC* cdict = lz4hc::create_stream_hc();
+    if (cdict == null) return null;
+    cdict.compression_level = compression_level;
+    lz4hc::load_dict_hc(cdict, dict_buffer);
+    return cdict;
+}
+
+fn void free_cdict(lz4::Stream* cdict) {
+    lz4::free_stream(cdict);
+}
+
+fn void free_cdict_hc(lz4hc::StreamHC* cdict) {
+    lz4hc::free_stream_hc(cdict);
 }

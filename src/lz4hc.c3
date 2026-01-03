@@ -97,6 +97,28 @@ fn int compress_hc(char[] src, char[] dst, int level) {
 }
 
 /**
+ * Compress using HC mode with fixed destination size.
+ * Compresses as much src as possible into dst.
+ * output src_read indicates how much src was consumed.
+ */
+fn int compress_hc_destSize(char[] src, char[] dst, int* src_read, int level) {
+    if (src.len == 0 || dst.len == 0) return 0;
+    
+    int clevel = level;
+    if (clevel < CLEVEL_MIN) clevel = CLEVEL_DEFAULT;
+    if (clevel > CLEVEL_MAX) clevel = CLEVEL_MAX;
+    
+    StreamHC* ctx = create_stream_hc();
+    if (ctx == null) return 0;
+    
+    ctx.compression_level = clevel;
+    int result = compress_hc_generic_dest(ctx, src, dst, clevel, src_read);
+    
+    free_stream_hc(ctx);
+    return result;
+}
+
+/**
  * Create streaming HC compression context.
  */
 fn StreamHC* create_stream_hc() {
@@ -472,4 +494,129 @@ fn int output_last_literals_hc(char* anchor, char* iend, char* op, char* olimit,
     }
     
     return (int)(op - dst_start);
+}
+
+fn int compress_hc_generic_dest(StreamHC* ctx, char[] src, char[] dst, int level, int* src_read) @private {
+    char* ip = src.ptr;
+    char* base = src.ptr;
+    char* anchor = ip;
+    char* iend = src.ptr + src.len;
+    char* mflimit_p = iend - MFLIMIT;
+    char* match_limit = iend - LASTLITERALS;
+    
+    char* op = dst.ptr;
+    char* olimit = dst.ptr + dst.len;
+    char* op_bottom = olimit - 1 - LASTLITERALS - RUN_MASK;
+    char* op_threshold = olimit - (1 + LASTLITERALS);
+    
+    int nb_searches = get_search_attempts(level);
+    
+    if (src.len < MFLIMIT + 1) {
+        return output_last_literals_hc_dest(anchor, iend, op, olimit, dst.ptr, src_read, base);
+    }
+    
+    while (ip < mflimit_p) {
+        uint ip_idx = (uint)(ip - base);
+        insert_hc(ctx, ip, base, ip_idx);
+        
+        int best_len = 0;
+        int best_off = 0;
+        
+        uint h = hash_hc(ip);
+        uint match_idx = ctx.hash_table[h];
+        int attempts = nb_searches;
+        
+        while (match_idx > 0 && attempts-- > 0 && ip_idx - match_idx <= DISTANCE_MAX) {
+            char* match = base + match_idx;
+            if (match >= base && match < ip) {
+                int len = count_match_hc(ip, match, match_limit);
+                if (len > best_len) {
+                    best_len = len;
+                    best_off = (int)(ip - match);
+                }
+            }
+            ushort delta = ctx.chain_table[match_idx & MAXD_MASK];
+            if (delta == 0xFFFF || delta == 0) break;
+            if (match_idx < delta) break;
+            match_idx -= delta;
+        }
+        
+        if (best_len < MINMATCH) {
+            ip++; continue;
+        }
+        
+        while (ip > anchor && ip - best_off > base && ip[-1] == ip[-1 - best_off]) {
+            ip--; best_len++;
+        }
+        
+        // Check output space aggressively
+        int lit_len = (int)(ip - anchor);
+        char* op_check = op + 1 + lit_len + (lit_len >> 8);
+        if (op_check > op_threshold) {
+             return output_last_literals_hc_dest(anchor, iend, op, olimit, dst.ptr, src_read, base);
+        }
+        
+        // Write token
+        char* token = op++;
+        
+        if (lit_len >= (int)RUN_MASK) {
+            *token = (char)(RUN_MASK << ML_BITS);
+            int remaining = lit_len - (int)RUN_MASK;
+            while (remaining >= 255) {
+                *op++ = (char)255; remaining -= 255;
+            }
+            *op++ = (char)remaining;
+        } else {
+            *token = (char)(lit_len << ML_BITS);
+        }
+        
+        for (int i = 0; i < lit_len; i++) *op++ = anchor[i];
+        
+        *op++ = (char)(best_off & 0xFF);
+        *op++ = (char)((best_off >> 8) & 0xFF);
+        
+        int ml_minus_min = best_len - MINMATCH;
+        if (ml_minus_min >= (int)ML_MASK) {
+            *token += (char)ML_MASK;
+            ml_minus_min -= (int)ML_MASK;
+            while (ml_minus_min >= 255) {
+                if (op >= olimit) return output_last_literals_hc_dest(anchor, iend, op - 1, olimit, dst.ptr, src_read, base);
+                *op++ = (char)255; ml_minus_min -= 255;
+            }
+            if (op >= olimit) return output_last_literals_hc_dest(anchor, iend, op - 1, olimit, dst.ptr, src_read, base);
+            *op++ = (char)ml_minus_min;
+        } else {
+            *token += (char)ml_minus_min;
+        }
+        
+        ip += best_len;
+        anchor = ip;
+        
+        if (op > op_bottom) {
+             return output_last_literals_hc_dest(anchor, iend, op, olimit, dst.ptr, src_read, base);
+        }
+    }
+    
+    return output_last_literals_hc_dest(anchor, iend, op, olimit, dst.ptr, src_read, base);
+}
+
+
+fn int output_last_literals_hc_dest(char* anchor, char* iend, char* op, char* olimit, char* dst_start, int* src_read, char* base) @private {
+    usz avail = (usz)(olimit - op);
+    if (avail < 1) return 0;
+    
+    usz max_lit = avail - 1;
+    usz lit_len = (usz)(iend - anchor);
+    if (lit_len > max_lit) {
+        lit_len = max_lit;
+        while (lit_len > 0) {
+             usz overhead = 1 + (lit_len >= 15 ? (lit_len - 15)/255 + 1 : 0);
+             if (overhead + lit_len <= avail) break;
+             lit_len--;
+        }
+    }
+    
+    if (src_read != null) *src_read = (int)((anchor + lit_len) - base);
+    
+    return output_last_literals_hc(anchor, anchor + lit_len, op, olimit, dst_start);
 }
