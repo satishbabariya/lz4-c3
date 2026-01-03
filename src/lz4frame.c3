@@ -313,6 +313,226 @@ fn usz get_block_size(int id) {
 }
 
 // ============================================================================
+// Streaming Frame Compression
+// ============================================================================
+
+/**
+ * Create a frame compression context.
+ * @return : pointer to context, or null on error
+ */
+fn CompressionContext* create_compression_context() {
+    CompressionContext* ctx = mem::new(CompressionContext);
+    if (ctx == null) return null;
+    
+    ctx.version_num = VERSION;
+    ctx.c_stage = 0;
+    ctx.max_block_size = 0;
+    ctx.max_buffer_size = 0;
+    ctx.tmp_buff = null;
+    ctx.tmp_in = null;
+    ctx.tmp_in_size = 0;
+    ctx.total_in_size = 0;
+    ctx.lz4_ctx = null;
+    ctx.lz4hc_ctx = null;
+    xxhash::reset32(&ctx.xxh, 0);
+    
+    return ctx;
+}
+
+/**
+ * Free a frame compression context.
+ */
+fn void free_compression_context(CompressionContext* ctx) {
+    if (ctx == null) return;
+    
+    if (ctx.tmp_buff != null) {
+        mem::free(ctx.tmp_buff);
+    }
+    if (ctx.lz4_ctx != null) {
+        lz4::free_stream(ctx.lz4_ctx);
+    }
+    if (ctx.lz4hc_ctx != null) {
+        lz4hc::free_stream_hc(ctx.lz4hc_ctx);
+    }
+    
+    mem::free(ctx);
+}
+
+/**
+ * Begin a frame compression.
+ * Writes the frame header to dst.
+ *
+ * @return : number of bytes written (header size), or 0 on error
+ */
+fn usz compress_begin(CompressionContext* ctx, char[] dst, Preferences* prefs) {
+    if (ctx == null || dst.len < HEADER_SIZE_MAX) return 0;
+    
+    // Copy preferences
+    if (prefs != null) {
+        ctx.prefs = *prefs;
+    } else {
+        ctx.prefs.frame_info.block_size_id = BLOCK_MAX64KB;
+        ctx.prefs.frame_info.block_mode = MODE_INDEPENDENT;
+        ctx.prefs.frame_info.content_checksum = CHECKSUM_ENABLED;
+        ctx.prefs.frame_info.block_checksum = CHECKSUM_DISABLED;
+        ctx.prefs.frame_info.content_size = 0;
+        ctx.prefs.frame_info.dict_id = 0;
+        ctx.prefs.compression_level = 0;
+        ctx.prefs.auto_flush = true;
+    }
+    
+    ctx.max_block_size = get_block_size(ctx.prefs.frame_info.block_size_id);
+    ctx.c_stage = 1;
+    ctx.total_in_size = 0;
+    xxhash::reset32(&ctx.xxh, 0);
+    
+    // Allocate internal buffer if needed
+    if (ctx.tmp_buff == null) {
+        ctx.max_buffer_size = ctx.max_block_size;
+        ctx.tmp_buff = mem::alloc_array(char, ctx.max_buffer_size);
+        if (ctx.tmp_buff == null) return 0;
+    }
+    ctx.tmp_in = ctx.tmp_buff;
+    ctx.tmp_in_size = 0;
+    
+    // Create compression context
+    if (ctx.prefs.compression_level >= 3) {
+        if (ctx.lz4hc_ctx == null) {
+            ctx.lz4hc_ctx = lz4hc::create_stream_hc();
+        }
+    } else {
+        if (ctx.lz4_ctx == null) {
+            ctx.lz4_ctx = lz4::create_stream();
+        }
+    }
+    
+    // Write header
+    return write_frame_header(dst.ptr, dst.ptr + dst.len, &ctx.prefs, 0);
+}
+
+/**
+ * Compress data chunk. May buffer data internally.
+ *
+ * @return : number of bytes written to dst, or 0 on error
+ */
+fn usz compress_update(CompressionContext* ctx, char[] dst, char[] src) {
+    if (ctx == null || ctx.c_stage == 0) return 0;
+    if (src.len == 0) return 0;
+    
+    char* op = dst.ptr;
+    char* op_end = dst.ptr + dst.len;
+    char* ip = src.ptr;
+    usz remaining = src.len;
+    
+    // Update content checksum
+    if (ctx.prefs.frame_info.content_checksum == CHECKSUM_ENABLED) {
+        xxhash::update32(&ctx.xxh, src);
+    }
+    ctx.total_in_size += src.len;
+    
+    // Process input
+    while (remaining > 0) {
+        usz to_buffer = ctx.max_block_size - ctx.tmp_in_size;
+        if (to_buffer > remaining) to_buffer = remaining;
+        
+        // Copy to internal buffer
+        for (usz i = 0; i < to_buffer; i++) {
+            ctx.tmp_in[ctx.tmp_in_size + i] = ip[i];
+        }
+        ctx.tmp_in_size += to_buffer;
+        ip += to_buffer;
+        remaining -= to_buffer;
+        
+        // Flush block if full
+        if (ctx.tmp_in_size == ctx.max_block_size) {
+            usz written = flush_block(ctx, op, op_end);
+            if (written == 0) return 0;
+            op += written;
+            ctx.tmp_in_size = 0;
+        }
+    }
+    
+    return (usz)(op - dst.ptr);
+}
+
+/**
+ * Finish frame compression. Writes any remaining data and end mark.
+ *
+ * @return : number of bytes written, or 0 on error
+ */
+fn usz compress_end(CompressionContext* ctx, char[] dst) {
+    if (ctx == null || ctx.c_stage == 0) return 0;
+    
+    char* op = dst.ptr;
+    char* op_end = dst.ptr + dst.len;
+    
+    // Flush any remaining data
+    if (ctx.tmp_in_size > 0) {
+        usz written = flush_block(ctx, op, op_end);
+        if (written == 0) return 0;
+        op += written;
+    }
+    
+    // Write end mark (0x00000000)
+    if (op + BLOCK_HEADER_SIZE > op_end) return 0;
+    write_le32(op, 0);
+    op += BLOCK_HEADER_SIZE;
+    
+    // Write content checksum
+    if (ctx.prefs.frame_info.content_checksum == CHECKSUM_ENABLED) {
+        if (op + BLOCK_CHECKSUM_SIZE > op_end) return 0;
+        uint content_crc = xxhash::digest32(&ctx.xxh);
+        write_le32(op, content_crc);
+        op += BLOCK_CHECKSUM_SIZE;
+    }
+    
+    ctx.c_stage = 0;
+    return (usz)(op - dst.ptr);
+}
+
+/**
+ * Get compressed bound for update operations.
+ */
+fn usz compress_bound(usz src_size, Preferences* prefs) {
+    usz block_size = get_block_size(prefs != null ? prefs.frame_info.block_size_id : BLOCK_DEFAULT);
+    usz nb_blocks = (src_size + block_size - 1) / block_size;
+    return src_size + nb_blocks * (BLOCK_HEADER_SIZE + BLOCK_CHECKSUM_SIZE);
+}
+
+fn usz flush_block(CompressionContext* ctx, char* op, char* op_end) @private {
+    if (ctx.tmp_in_size == 0) return 0;
+    
+    usz max_compressed = lz4::compress_bound((int)ctx.tmp_in_size);
+    if (op + BLOCK_HEADER_SIZE + max_compressed > op_end) return 0;
+    
+    char[] block_src = ctx.tmp_buff[0:ctx.tmp_in_size];
+    
+    int compressed_size;
+    if (ctx.prefs.compression_level >= 3) {
+        compressed_size = lz4hc::compress_hc(block_src, op[BLOCK_HEADER_SIZE:max_compressed], ctx.prefs.compression_level);
+    } else {
+        compressed_size = lz4::compress_default(block_src, op[BLOCK_HEADER_SIZE:max_compressed]);
+    }
+    
+    usz written;
+    if (compressed_size > 0 && (usz)compressed_size < ctx.tmp_in_size) {
+        // Write compressed block
+        write_le32(op, (uint)compressed_size);
+        written = (usz)BLOCK_HEADER_SIZE + (usz)compressed_size;
+    } else {
+        // Store uncompressed
+        write_le32(op, (uint)ctx.tmp_in_size | BLOCK_UNCOMPRESSED_FLAG);
+        char* dst = op + BLOCK_HEADER_SIZE;
+        for (usz i = 0; i < ctx.tmp_in_size; i++) {
+            dst[i] = ctx.tmp_buff[i];
+        }
+        written = (usz)BLOCK_HEADER_SIZE + ctx.tmp_in_size;
+    }
+    
+    return written;
+}
+
+// ============================================================================
 // Internal Functions
 // ============================================================================
 

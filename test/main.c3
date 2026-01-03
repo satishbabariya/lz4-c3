@@ -19,6 +19,7 @@ fn void main() {
     test_hc_compression();
     test_xxhash();
     test_frame_compression();
+    test_streaming_frame();
     
     io::printn("\n=== All Tests Complete ===");
 }
@@ -269,3 +270,76 @@ fn void test_frame_compression() {
         io::printn("✗ Frame format: FAIL");
     }
 }
+
+fn void test_streaming_frame() {
+    io::printn("\n--- Streaming Frame Test ---");
+    
+    char[] test_data = "This is a streaming test. "
+                       "We will compress this data in multiple small chunks to simulate a stream. "
+                       "The output should be a valid LZ4 frame readable by standard tools. "
+                       "Repeating repeating repeating repeating repeating.";
+    
+    // Create context
+    lz4frame::CompressionContext* ctx = lz4frame::create_compression_context();
+    if (ctx == null) {
+        io::printn("✗ Failed to create compression context");
+        return;
+    }
+    
+    char[1024] compressed_buf;
+    char* base_ptr = (char*)&compressed_buf;
+    char* op = base_ptr;
+    char* op_end = base_ptr + 1024;
+    
+    // Begin
+    usz written = lz4frame::compress_begin(ctx, compressed_buf[0:1024], null);
+    if (written == 0) {
+        io::printn("✗ compress_begin failed");
+        return;
+    }
+    op += written;
+    
+    // Update (chunk 1)
+    usz split = test_data.len / 2;
+    usz offset1 = (usz)(op - base_ptr);
+    if (offset1 >= 1024) return;
+    usz w1 = lz4frame::compress_update(ctx, compressed_buf[offset1:1024-offset1], test_data[0:split]);
+    if (w1 == 0) {
+        // Warning: it's possible for update to return 0 if buffering, but we expect some output or at least no error
+    }
+    op += w1;
+    
+    // Update (chunk 2)
+    usz offset2 = (usz)(op - base_ptr);
+    if (offset2 >= 1024) return;
+    usz w2 = lz4frame::compress_update(ctx, compressed_buf[offset2:1024-offset2], test_data[split:test_data.len - split]);
+    op += w2;
+    
+    // End
+    usz offset3 = (usz)(op - base_ptr);
+    if (offset3 >= 1024) return;
+    usz w3 = lz4frame::compress_end(ctx, compressed_buf[offset3:1024-offset3]);
+    if (w3 == 0) {
+       // Could be error or just nothing to flush? End mark is at least 4 bytes.
+       io::printn("✗ compress_end failed (returned 0)");
+       return;
+    }
+    op += w3;
+    
+    lz4frame::free_compression_context(ctx);
+    
+    usz total_compressed = (usz)(op - base_ptr);
+    io::printfn("Compressed stream: %d bytes", total_compressed);
+    
+    // Verify by decompressing
+    char[1024] decompressed_buf;
+    usz decomp_size = lz4frame::decompress_frame(compressed_buf[0:total_compressed], decompressed_buf[0:1024]);
+    
+    bool match = verify_data(test_data, decompressed_buf[0:decomp_size]);
+    if (match) {
+        io::printn("✓ Streaming frame: PASS");
+    } else {
+        io::printn("✗ Streaming frame: FAIL");
+    }
+}
+

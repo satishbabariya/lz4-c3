@@ -662,6 +662,85 @@ fn int save_dict(Stream* stream, char[] safe_buffer) {
     return (int)to_save;
 }
 
+/**
+ * Load dictionary using slower but more thorough method.
+ * Processes every position in dictionary, not just sampled positions.
+ * Better compression for small dictionaries at cost of slower loading.
+ *
+ * @return : loaded dictionary size (max 64KB)
+ */
+fn int load_dict_slow(Stream* stream, char[] dictionary) {
+    if (stream == null) return 0;
+    
+    // Reset stream completely
+    for (int i = 0; i < HASH_SIZE_U32; i++) {
+        stream.hash_table[i] = 0;
+    }
+    stream.current_offset = 0;
+    stream.dict_ctx = null;
+    
+    if (dictionary.len == 0) {
+        stream.dictionary = null;
+        stream.dict_size = 0;
+        return 0;
+    }
+    
+    // Only use last 64KB of dictionary
+    usz dict_size = dictionary.len;
+    char* dict_start = dictionary.ptr;
+    if (dict_size > 64 * 1024) {
+        dict_start = dictionary.ptr + dictionary.len - 64 * 1024;
+        dict_size = 64 * 1024;
+    }
+    
+    stream.dictionary = dict_start;
+    stream.dict_size = (uint)dict_size;
+    
+    // Fill hash table with EVERY position (slower, better compression)
+    if (dict_size >= MINMATCH) {
+        char* p = dict_start;
+        char* dict_end = dict_start + dict_size - MINMATCH + 1;
+        uint idx = 0;
+        while (p < dict_end) {
+            uint h = hash_position(p) & (HASH_SIZE_U32 - 1);
+            stream.hash_table[h] = idx;
+            p++;
+            idx++;
+        }
+    }
+    
+    stream.current_offset = (uint)dict_size;
+    return (int)dict_size;
+}
+
+/**
+ * Attach a pre-filled dictionary Stream to a working Stream.
+ * The dictionary stream must remain valid during compression.
+ * This allows reusing a pre-computed dictionary across multiple compressions.
+ *
+ * @param working_stream : stream to attach dictionary to
+ * @param dict_stream : pre-filled dictionary stream (from load_dict)
+ */
+fn void attach_dictionary(Stream* working_stream, Stream* dict_stream) {
+    if (working_stream == null) return;
+    
+    // Reset working stream
+    reset_stream_fast(working_stream);
+    
+    // Clear hash table
+    for (int i = 0; i < HASH_SIZE_U32; i++) {
+        working_stream.hash_table[i] = 0;
+    }
+    
+    // Attach dictionary reference
+    working_stream.dict_ctx = dict_stream;
+    
+    if (dict_stream != null) {
+        working_stream.dictionary = dict_stream.dictionary;
+        working_stream.dict_size = dict_stream.dict_size;
+    }
+}
+
 // ============================================================================
 // Streaming Decompression
 // ============================================================================

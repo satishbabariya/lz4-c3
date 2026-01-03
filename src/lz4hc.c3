@@ -186,6 +186,36 @@ fn int load_dict_hc(StreamHC* stream, char[] dictionary) {
 }
 
 /**
+ * Attach a pre-filled dictionary StreamHC to a working StreamHC.
+ * The dictionary stream must remain valid during compression.
+ * This allows reusing a pre-computed dictionary across multiple compressions.
+ *
+ * @param working_stream : stream to attach dictionary to
+ * @param dict_stream : pre-filled dictionary stream (from load_dict_hc)
+ */
+fn void attach_HC_dictionary(StreamHC* working_stream, StreamHC* dict_stream) {
+    if (working_stream == null) return;
+    
+    // Reset working stream
+    reset_stream_hc_fast(working_stream, working_stream.compression_level);
+    
+    // Clear hash table (must be cleared because we don't copy it)
+    for (int i = 0; i < HC_HASHTABLESIZE; i++) {
+        working_stream.hash_table[i] = 0;
+    }
+    
+    // Attach dictionary reference
+    working_stream.dict_ctx = dict_stream;
+    
+    // Initialize limits from dictionary
+    if (dict_stream != null) {
+        working_stream.dict_start = dict_stream.dict_start;
+        working_stream.dict_limit = dict_stream.dict_limit;
+        working_stream.low_limit = dict_stream.low_limit;
+    }
+}
+
+/**
  * Streaming HC compression.
  */
 fn int compress_hc_continue(StreamHC* stream, char[] src, char[] dst) {
